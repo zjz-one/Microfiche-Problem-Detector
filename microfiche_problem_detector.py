@@ -2368,32 +2368,21 @@ class PythonHeuristicEngine:
         done = 0
         self.progress_cb(done, max(total_pages, 1))
 
-        if pdf_paths and (scope == "source" or not self.batch_width_info):
-            try:
-                self.log(f"Estimating normal page width for {scope} pages...")
-                self.batch_width_info = estimate_width_baseline(
-                    pdf_paths,
-                    dpi=self.render_dpi,
-                    max_width=100000,
-                    quality=55,
-                )
-                self.batch_width_info = self._apply_parameter_override(self.batch_width_info)
-                self.log(
-                    "Width baseline: "
-                    f"normal_width={self.batch_width_info.get('baseline_body_width')} "
-                    f"overlap_width={self.batch_width_info.get('body_width_overlap_threshold')} "
-                    f"multiplier={self.batch_width_info.get('body_width_overlap_rel_threshold')} "
-                    f"pages={self.batch_width_info.get('page_count')}"
-                )
-            except Exception as exc:
-                self.batch_width_info = {
-                    "baseline_body_width": 0.0,
-                    "body_width_overlap_rel_threshold": PY_WIDTH_OVERLAP_REL_THRESHOLD,
-                    "body_width_overlap_threshold": 0.0,
+        if scope == "source" or not self.batch_width_info:
+            self.batch_width_info = self._apply_parameter_override(
+                {
+                    "baseline_body_width": float(DEFAULT_NORMAL_BODY_WIDTH),
+                    "body_width_overlap_rel_threshold": float(PY_WIDTH_OVERLAP_REL_THRESHOLD),
+                    "body_width_overlap_threshold": round(float(DEFAULT_NORMAL_BODY_WIDTH) * float(PY_WIDTH_OVERLAP_REL_THRESHOLD), 3),
                     "page_count": 0,
                 }
-                self.batch_width_info = self._apply_parameter_override(self.batch_width_info)
-                self.log(f"Width baseline estimation failed; using configured values only: {exc}")
+            )
+            self.log(
+                "Width settings: "
+                f"normal_width={self.batch_width_info.get('baseline_body_width')} "
+                f"overlap_width={self.batch_width_info.get('body_width_overlap_threshold')} "
+                f"multiplier={self.batch_width_info.get('body_width_overlap_rel_threshold')}"
+            )
         elif self.batch_width_info:
             self.log(
                 "Reusing width baseline: "
