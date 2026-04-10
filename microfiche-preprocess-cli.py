@@ -13,6 +13,7 @@ _APP_SPEC = importlib.util.spec_from_file_location("microfiche_preprocess_app", 
 if _APP_SPEC is None or _APP_SPEC.loader is None:
     raise RuntimeError(f"Failed to load {_APP_SCRIPT_PATH}")
 _APP_MODULE = importlib.util.module_from_spec(_APP_SPEC)
+sys.modules[_APP_SPEC.name] = _APP_MODULE
 _APP_SPEC.loader.exec_module(_APP_MODULE)
 
 DEFAULT_CROP_RATIO = _APP_MODULE.DEFAULT_CROP_RATIO
@@ -119,14 +120,6 @@ def main() -> int:
             file_path=str(pdf_path),
             baseline_body_width=float(info.get("baseline_body_width") or 0.0),
             text=f"Current estimated width: {pdf_path.name} -> {float(info.get('baseline_body_width') or 0.0):.0f}",
-        ),
-        crop_detected=lambda pdf_path, info: writer.emit(
-            "crop-detected",
-            file_name=pdf_path.name,
-            file_path=str(pdf_path),
-            body_ratio=float(info.get("body_ratio") or 0.0),
-            crop_ratio=float(info.get("crop_ratio") or 0.0),
-            text=f"Current detected ratio: {pdf_path.name} -> {float(info.get('body_ratio') or 0.0):.4f}",
         ),
         replace_cropped_dir=lambda output_dir: writer.emit(
             "suggested-cropped-dir",

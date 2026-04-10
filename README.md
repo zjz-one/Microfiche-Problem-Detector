@@ -10,6 +10,12 @@ Included:
 - `build-exe.bat`
 - `.github/workflows/build-windows-exe.yml`
 
+Features:
+- `overlap`
+- `crop`
+- `convert`
+- `replace`
+
 ## GitHub Actions
 
 1. Create a new GitHub repository.

@@ -187,7 +187,6 @@ class PipelineHooks:
     status: Callable[[str], None]
     progress: Callable[[int, int], None]
     overlap_estimate: Optional[Callable[[Path, Dict[str, Any]], None]] = None
-    crop_detected: Optional[Callable[[Path, Dict[str, Any]], None]] = None
     replace_cropped_dir: Optional[Callable[[Path], None]] = None
 
 
@@ -1091,7 +1090,6 @@ def detect_page_body_rect(
         "pdf_rect": pdf_rect,
         "body_width": float(pdf_rect.width),
         "body_height": float(pdf_rect.height),
-        "body_ratio": float(pdf_rect.width) / max(float(pdf_rect.height), 1.0),
     }
 
 
@@ -1145,7 +1143,6 @@ def export_cropped_first_page(
         return {
             "body_width": round(body_info["body_width"], 3),
             "body_height": round(body_info["body_height"], 3),
-            "body_ratio": round(body_info["body_ratio"], 4),
             "crop_width": round(float(crop_rect.width), 3),
             "crop_height": round(float(crop_rect.height), 3),
             "crop_ratio": round(float(crop_rect.width) / max(float(crop_rect.height), 1.0), 4),
@@ -1665,13 +1662,11 @@ def run_crop_pipeline(
                 created_count += 1
                 if uncropped_pdf.exists():
                     uncropped_pdf.unlink()
-                if hooks.crop_detected:
-                    hooks.crop_detected(src_pdf, info)
                 if hooks.replace_cropped_dir:
                     hooks.replace_cropped_dir(config.cropped_dir)
                 runlog(
                     f"Cropped {src_pdf.name} -> {out_pdf} "
-                    f"(body_ratio={info['body_ratio']}, crop_ratio={info['crop_ratio']})"
+                    f"(crop_ratio={info['crop_ratio']})"
                 )
             except Exception as exc:
                 try:
@@ -2619,13 +2614,6 @@ class App(tk.Tk):
             width=10,
             justify="center",
         )
-        tk.Label(
-            params_body,
-            textvariable=self.detected_crop_ratio_var,
-            font=self.font_ui,
-            fg=self.ui["text_muted"],
-            bg=self.ui["surface"],
-        ).pack(anchor="w", pady=(14, 0))
 
     def _build_replace_tab(self, parent: tk.Widget) -> None:
         source_shell = self._flat_panel(parent)
@@ -2655,7 +2643,6 @@ class App(tk.Tk):
         self.param_overlap_multiplier_var = tk.StringVar(value="")
         self.param_crop_ratio_var = tk.StringVar(value="")
         self.estimated_normal_width_var = tk.StringVar(value="Current estimated width: -")
-        self.detected_crop_ratio_var = tk.StringVar(value="Current detected ratio: -")
         self.ov_csv_var = tk.BooleanVar(value=True)
         self.ov_overlap_var = tk.BooleanVar(value=True)
         self.ov_eo_var = tk.BooleanVar(value=True)
@@ -2756,7 +2743,6 @@ class App(tk.Tk):
         self.param_overlap_multiplier_var.set(f"{PY_WIDTH_OVERLAP_REL_THRESHOLD:.2f}")
         self.param_crop_ratio_var.set(f"{DEFAULT_CROP_RATIO:.3f}")
         self.estimated_normal_width_var.set("Current estimated width: -")
-        self.detected_crop_ratio_var.set("Current detected ratio: -")
         for variable in [
             self.param_overlap_multiplier_var,
             self.param_crop_ratio_var,
@@ -2943,12 +2929,6 @@ class App(tk.Tk):
                     0,
                     lambda: self.estimated_normal_width_var.set(
                         f"Current estimated width: {pdf_path.name} -> {float(info.get('baseline_body_width') or 0.0):.0f}"
-                    ),
-                ),
-                crop_detected=lambda src_pdf, info: self.after(
-                    0,
-                    lambda: self.detected_crop_ratio_var.set(
-                        f"Current detected ratio: {src_pdf.name} -> {float(info.get('body_ratio') or 0.0):.4f}"
                     ),
                 ),
                 replace_cropped_dir=lambda output_dir: self.after(
