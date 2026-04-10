@@ -14,7 +14,7 @@ if %errorlevel%==0 (
   if %errorlevel%==0 (
     set PY=python
   ) else (
-    echo [ERROR] Python not found. Install Python 3.10+ first.
+    echo [ERROR] Python not found. Install Python 3.11+ first.
     echo Python not found >> "%LOG%"
     goto :fail
   )
@@ -24,10 +24,10 @@ echo [info] Using launcher: %PY%
 echo Using launcher: %PY% >> "%LOG%"
 
 echo [1/6] Create venv...
-%PY% -m venv .venv_build >> "%LOG%" 2>&1
+%PY% -m venv .venv-build >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
-call .venv_build\Scripts\activate.bat
+call .venv-build\Scripts\activate.bat
 if errorlevel 1 (
   echo activate failed >> "%LOG%"
   goto :fail
@@ -46,17 +46,17 @@ python -m pip install -r requirements.txt pyinstaller >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [5/6] Build exe...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name MicroficheProblemDetector microfiche_problem_detector.py >> "%LOG%" 2>&1
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name Microfiche-Preprocess microfiche-preprocess.py >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [6/6] Verify output...
-if not exist "%cd%\dist\MicroficheProblemDetector.exe" (
+if not exist "%cd%\dist\Microfiche-Preprocess.exe" (
   echo dist exe missing >> "%LOG%"
   goto :fail
 )
 
 echo Build succeeded.
-echo EXE: %cd%\dist\MicroficheProblemDetector.exe
+echo EXE: %cd%\dist\Microfiche-Preprocess.exe
 echo Build succeeded >> "%LOG%"
 echo ==== Build end %date% %time% ==== >> "%LOG%"
 exit /b 0
