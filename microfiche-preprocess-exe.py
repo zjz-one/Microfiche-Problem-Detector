@@ -7,8 +7,8 @@ from pathlib import Path
 
 
 def _load_main():
-    script_path = Path(__file__).with_name("microfiche-preprocess.py")
-    spec = importlib.util.spec_from_file_location("microfiche_preprocess_app", script_path)
+    script_path = Path(__file__).with_name("microfiche-preprocess-ui.py")
+    spec = importlib.util.spec_from_file_location("microfiche_preprocess_ui", script_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load {script_path}")
     module = importlib.util.module_from_spec(spec)

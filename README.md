@@ -4,8 +4,11 @@ Upload the contents of this `win/` folder as the root of a GitHub repository.
 
 Included:
 - `microfiche-preprocess.py`
+- `microfiche-preprocess-ui.py`
 - `microfiche-preprocess-exe.py`
 - `microfiche-preprocess-cli.py`
+- `microfiche-preprocess.ico`
+- `fonts/`
 - `requirements.txt`
 - `build-exe.bat`
 - `.github/workflows/build-windows-exe.yml`
@@ -38,5 +41,5 @@ Output:
 
 ## Notes
 
-- The EXE is built from `microfiche-preprocess.py`.
-- The current Windows UI is the Python desktop UI, not the native macOS SwiftUI shell.
+- The EXE is built from `microfiche-preprocess-ui.py`.
+- The packaged desktop UI is the shared cross-platform front-end.

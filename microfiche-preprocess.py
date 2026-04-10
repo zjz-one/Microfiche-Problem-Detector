@@ -5,6 +5,7 @@ import ctypes
 import csv
 import datetime as dt
 from dataclasses import dataclass
+import importlib.util
 import io
 import json
 import os
@@ -25,7 +26,7 @@ from PIL import Image, ImageOps
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-APP_NAME = "Microfiche Problem Detector"
+APP_NAME = "Microfiche Preprocess"
 NOTEBOOK_HEIGHT_OVERLAP = 268
 NOTEBOOK_HEIGHT_BLURRY = 360
 
@@ -2262,7 +2263,10 @@ class App(tk.Tk):
         self.pause_event = threading.Event()
         self.worker_thread: Optional[threading.Thread] = None
         self.mode_var = tk.StringVar(value="overlap")
+        self.convert_action_var = tk.StringVar(value="pdf-to-jpeg")
         self.mode_buttons: Dict[str, PillButton] = {}
+        self.convert_action_buttons: Dict[str, PillButton] = {}
+        self.convert_panel_shells: Dict[str, tk.Frame] = {}
         self.toggle_chips: List[Tuple[PillButton, tk.BooleanVar]] = []
         self.mode_frames: Dict[str, tk.Frame] = {}
         self.metric_widgets: List[Tuple[tk.Frame, tk.StringVar, tk.StringVar]] = []
@@ -2438,10 +2442,40 @@ class App(tk.Tk):
         self.mode_buttons[mode] = btn
         return btn
 
+    def _make_convert_action_button(self, parent: tk.Widget, action: str, text: str) -> PillButton:
+        btn = PillButton(
+            parent,
+            text=text,
+            command=lambda value=action: self._select_convert_action(value),
+            font=self.font_button,
+            palette_off=self._chip_palette_off(),
+            palette_on=self._chip_palette_on(),
+            height=32,
+            radius=2,
+            padding_x=12,
+            text_offset_y=0,
+            min_width=132,
+            align="left",
+        )
+        self.convert_action_buttons[action] = btn
+        return btn
+
     def _refresh_mode_buttons(self) -> None:
         current = self.mode_var.get()
         for mode, btn in self.mode_buttons.items():
             btn.set_active(mode == current)
+
+    def _select_convert_action(self, action: str) -> None:
+        self.convert_action_var.set(action)
+        self._refresh_convert_actions()
+
+    def _refresh_convert_actions(self) -> None:
+        current = self.convert_action_var.get()
+        for action, btn in self.convert_action_buttons.items():
+            btn.set_active(action == current)
+        for action, shell in self.convert_panel_shells.items():
+            shell.configure(highlightbackground=self.ui["text"] if action == current else self.ui["border"])
+        self._refresh_mode_dashboard()
 
     def _style_text_widget(self, widget: ScrolledText) -> None:
         widget.configure(
@@ -2569,23 +2603,8 @@ class App(tk.Tk):
             browse_command=self.pick_overlap_source_dir,
         )
 
-        details = tk.Frame(parent, bg=self.ui["surface_base"])
-        details.pack(fill=tk.X, pady=(32, 0))
-        details.columnconfigure(0, weight=1)
-        details.columnconfigure(1, weight=1)
-
-        outputs_shell = self._flat_panel(details)
-        outputs_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
-        outputs_body = tk.Frame(outputs_shell, bg=self.ui["surface"])
-        outputs_body.pack(fill=tk.BOTH, expand=True, padx=32, pady=32)
-        chips = tk.Frame(outputs_body, bg=self.ui["surface"])
-        chips.pack(fill=tk.X)
-        for index, (label, var) in enumerate([("CSV", self.ov_csv_var), ("Overlap", self.ov_overlap_var), ("Extracted Original", self.ov_eo_var)]):
-            chip = self._make_toggle_chip(chips, label, var)
-            chip.grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 8), pady=(0, 8))
-
-        params_shell = self._flat_panel(details)
-        params_shell.grid(row=0, column=1, sticky="nsew", padx=(16, 0))
+        params_shell = self._flat_panel(parent)
+        params_shell.pack(fill=tk.X, pady=(32, 0))
         params_body = tk.Frame(params_shell, bg=self.ui["surface"])
         params_body.pack(fill=tk.BOTH, expand=True, padx=32, pady=32)
         self.param_overlap_entry = self._labeled_entry_row(params_body, "Multiplier", self.param_overlap_multiplier_var, width=10, justify="center")
@@ -2615,6 +2634,37 @@ class App(tk.Tk):
             justify="center",
         )
 
+    def _build_convert_tab(self, parent: tk.Widget) -> None:
+        pdf_shell = self._flat_panel(parent)
+        pdf_shell.pack(fill=tk.X)
+        self.convert_panel_shells["pdf-to-jpeg"] = pdf_shell
+        pdf_body = tk.Frame(pdf_shell, bg=self.ui["surface"])
+        pdf_body.pack(fill=tk.X, padx=32, pady=32)
+        pdf_header = tk.Frame(pdf_body, bg=self.ui["surface"])
+        pdf_header.pack(fill=tk.X)
+        self._make_convert_action_button(pdf_header, "pdf-to-jpeg", "PDF -> JPEG").pack(anchor="w")
+        self.pdf_to_jpeg_source_dir_entry = self._labeled_entry_row(
+            pdf_body,
+            "Source",
+            self.pdf_to_jpeg_source_dir_var,
+            browse_command=self.pick_pdf_to_jpeg_source_dir,
+        )
+
+        jpeg_shell = self._flat_panel(parent)
+        jpeg_shell.pack(fill=tk.X, pady=(32, 0))
+        self.convert_panel_shells["jpeg-to-pdf"] = jpeg_shell
+        jpeg_body = tk.Frame(jpeg_shell, bg=self.ui["surface"])
+        jpeg_body.pack(fill=tk.X, padx=32, pady=32)
+        jpeg_header = tk.Frame(jpeg_body, bg=self.ui["surface"])
+        jpeg_header.pack(fill=tk.X)
+        self._make_convert_action_button(jpeg_header, "jpeg-to-pdf", "JPEG -> PDF").pack(anchor="w")
+        self.jpeg_to_pdf_source_dir_entry = self._labeled_entry_row(
+            jpeg_body,
+            "Source",
+            self.jpeg_to_pdf_source_dir_var,
+            browse_command=self.pick_jpeg_to_pdf_source_dir,
+        )
+
     def _build_replace_tab(self, parent: tk.Widget) -> None:
         source_shell = self._flat_panel(parent)
         source_shell.pack(fill=tk.X)
@@ -2638,6 +2688,8 @@ class App(tk.Tk):
         self.csv_path_var = tk.StringVar()
         self.overlap_source_dir_var = tk.StringVar()
         self.crop_source_dir_var = tk.StringVar()
+        self.pdf_to_jpeg_source_dir_var = tk.StringVar()
+        self.jpeg_to_pdf_source_dir_var = tk.StringVar()
         self.replace_cropped_dir_var = tk.StringVar()
         self.replace_target_dir_var = tk.StringVar()
         self.param_overlap_multiplier_var = tk.StringVar(value="")
@@ -2657,7 +2709,7 @@ class App(tk.Tk):
         tk.Frame(root, bg=self.ui["border"], width=1).pack(side=tk.LEFT, fill=tk.Y)
         tk.Label(
             sidebar,
-            text="MICROFICHE",
+            text="MENU",
             font=self.font_logo,
             fg=self.ui["text"],
             bg=self.ui["surface_section"],
@@ -2665,9 +2717,10 @@ class App(tk.Tk):
         ).pack(fill=tk.X, padx=32, pady=(32, 24))
         nav = tk.Frame(sidebar, bg=self.ui["surface_section"])
         nav.pack(fill=tk.X, padx=32)
-        self._make_mode_button(nav, "overlap", "Overlap").pack(fill=tk.X)
-        self._make_mode_button(nav, "crop", "Crop").pack(fill=tk.X, pady=(8, 0))
-        self._make_mode_button(nav, "replace", "Replace").pack(fill=tk.X, pady=(8, 0))
+        self._make_mode_button(nav, "overlap", "OVERLAP").pack(fill=tk.X)
+        self._make_mode_button(nav, "crop", "CROP").pack(fill=tk.X, pady=(8, 0))
+        self._make_mode_button(nav, "convert", "CONVERT").pack(fill=tk.X, pady=(8, 0))
+        self._make_mode_button(nav, "replace", "REPLACE").pack(fill=tk.X, pady=(8, 0))
 
         sidebar_footer = tk.Frame(sidebar, bg=self.ui["surface_section"])
         sidebar_footer.pack(side=tk.BOTTOM, fill=tk.X, padx=32, pady=32)
@@ -2692,24 +2745,28 @@ class App(tk.Tk):
         action_bar.pack(side=tk.RIGHT)
         self.run_btn = self._make_button(action_bar, "Run", self.run_pipeline, kind="primary")
         self.run_btn.pack(side=tk.LEFT)
-        self.pause_btn_text = tk.StringVar(value="Pause")
+        self.run_btn.set_text("RUN")
+        self.pause_btn_text = tk.StringVar(value="PAUSE")
         self.pause_btn = self._make_button(action_bar, self.pause_btn_text.get(), self.pause_pipeline, kind="secondary")
         self.pause_btn.pack(side=tk.LEFT, padx=(8, 0))
-        self.stop_btn = self._make_button(action_bar, "Stop", self.stop_pipeline, kind="secondary")
+        self.stop_btn = self._make_button(action_bar, "STOP", self.stop_pipeline, kind="secondary")
         self.stop_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         self.mode_container = tk.Frame(main, bg=self.ui["surface_base"])
         self.mode_container.pack(fill=tk.X, padx=32, pady=(32, 0))
         self.overlap_frame = tk.Frame(self.mode_container, bg=self.ui["bg"])
         self.crop_frame = tk.Frame(self.mode_container, bg=self.ui["bg"])
+        self.convert_frame = tk.Frame(self.mode_container, bg=self.ui["bg"])
         self.replace_frame = tk.Frame(self.mode_container, bg=self.ui["bg"])
         self.mode_frames = {
             "overlap": self.overlap_frame,
             "crop": self.crop_frame,
+            "convert": self.convert_frame,
             "replace": self.replace_frame,
         }
         self._build_overlap_tab(self.overlap_frame)
         self._build_crop_tab(self.crop_frame)
+        self._build_convert_tab(self.convert_frame)
         self._build_replace_tab(self.replace_frame)
 
         status_row = tk.Frame(main, bg=self.ui["surface_base"])
@@ -2734,15 +2791,17 @@ class App(tk.Tk):
         self._style_text_widget(self.log_text)
 
     def _load_defaults(self) -> None:
-        default_dir = str(Path.cwd())
-        self.overlap_source_dir_var.set(default_dir)
-        self.crop_source_dir_var.set(default_dir)
-        self.replace_cropped_dir_var.set(str(Path(default_dir) / "cropped"))
-        self.replace_target_dir_var.set(default_dir)
+        self.overlap_source_dir_var.set("")
+        self.crop_source_dir_var.set("")
+        self.pdf_to_jpeg_source_dir_var.set("")
+        self.jpeg_to_pdf_source_dir_var.set("")
+        self.replace_cropped_dir_var.set("")
+        self.replace_target_dir_var.set("")
         self.csv_path_var.set("")
         self.param_overlap_multiplier_var.set(f"{PY_WIDTH_OVERLAP_REL_THRESHOLD:.2f}")
         self.param_crop_ratio_var.set(f"{DEFAULT_CROP_RATIO:.3f}")
         self.estimated_normal_width_var.set("Current estimated width: -")
+        self.convert_action_var.set("pdf-to-jpeg")
         for variable in [
             self.param_overlap_multiplier_var,
             self.param_crop_ratio_var,
@@ -2753,6 +2812,7 @@ class App(tk.Tk):
             variable.trace_add("write", lambda *_args: self._refresh_mode_dashboard())
         self._apply_mode_layout()
         self._refresh_toggle_chips()
+        self._refresh_convert_actions()
 
     def _parameter_override(self) -> Dict[str, float]:
         out: Dict[str, float] = {}
@@ -2787,11 +2847,16 @@ class App(tk.Tk):
                 if frame.winfo_manager():
                     frame.pack_forget()
         self._refresh_mode_buttons()
+        self._refresh_convert_actions()
         self._refresh_mode_dashboard()
 
     def _refresh_mode_dashboard(self) -> None:
         mode = self._current_mode()
-        self.title(f"{APP_NAME} · {mode.title()}")
+        if mode == "convert":
+            action = self.convert_action_var.get().replace("-", " ").upper()
+            self.title(f"{APP_NAME} · CONVERT · {action}")
+        else:
+            self.title(f"{APP_NAME} · {mode.upper()}")
 
     def _drain_logs(self) -> None:
         try:
@@ -2818,6 +2883,12 @@ class App(tk.Tk):
     def pick_crop_source_dir(self) -> None:
         self._pick_directory_into_var(self.crop_source_dir_var, "Select Crop Directory")
 
+    def pick_pdf_to_jpeg_source_dir(self) -> None:
+        self._pick_directory_into_var(self.pdf_to_jpeg_source_dir_var, "Select PDF Directory")
+
+    def pick_jpeg_to_pdf_source_dir(self) -> None:
+        self._pick_directory_into_var(self.jpeg_to_pdf_source_dir_var, "Select JPEG Directory")
+
     def pick_replace_cropped_dir(self) -> None:
         self._pick_directory_into_var(self.replace_cropped_dir_var, "Select Cropped Directory")
 
@@ -2829,13 +2900,13 @@ class App(tk.Tk):
             return
         if self.pause_event.is_set():
             self.pause_event.clear()
-            self.pause_btn_text.set("Pause")
+            self.pause_btn_text.set("PAUSE")
             self.pause_btn.set_text(self.pause_btn_text.get())
             self._set_status("Resumed.")
             self.log("Pipeline resumed.")
         else:
             self.pause_event.set()
-            self.pause_btn_text.set("Resume")
+            self.pause_btn_text.set("RESUME")
             self.pause_btn.set_text(self.pause_btn_text.get())
             self._set_status("Paused. Waiting after the current request.")
             self.log("Pipeline paused.")
@@ -2844,7 +2915,7 @@ class App(tk.Tk):
         self.cancel_event.set()
         self.pause_event.clear()
         if hasattr(self, "pause_btn_text"):
-            self.pause_btn_text.set("Pause")
+            self.pause_btn_text.set("PAUSE")
             self.pause_btn.set_text(self.pause_btn_text.get())
         self._set_status("Stop requested. Finishing the current request before shutdown.")
         self.log("Stop requested.")
@@ -2857,8 +2928,11 @@ class App(tk.Tk):
         mode = self._current_mode()
         overlap_source_dir = Path(self.overlap_source_dir_var.get().strip())
         crop_source_dir = Path(self.crop_source_dir_var.get().strip())
+        pdf_to_jpeg_source_dir = Path(self.pdf_to_jpeg_source_dir_var.get().strip())
+        jpeg_to_pdf_source_dir = Path(self.jpeg_to_pdf_source_dir_var.get().strip())
         replace_cropped_dir = Path(self.replace_cropped_dir_var.get().strip())
         replace_target_dir = Path(self.replace_target_dir_var.get().strip())
+        convert_action = self.convert_action_var.get()
         recursive = True
         live_output = True
         parameter_override = self._parameter_override()
@@ -2888,6 +2962,25 @@ class App(tk.Tk):
             problem_csv_path = batch_root / "problem_pages.csv"
             run_log_path = cropped_dir / f"{mode}_run_{now_file_ts()}.txt"
             self.csv_path_var.set("")
+        elif mode == "convert":
+            crop_ratio = 0.0
+            batch_root = Path.cwd()
+            estimate_csv_path = batch_root / "estimated_widths.csv"
+            problem_csv_path = batch_root / "problem_pages.csv"
+            self.csv_path_var.set("")
+            if convert_action == "pdf-to-jpeg":
+                if not pdf_to_jpeg_source_dir.exists() or not pdf_to_jpeg_source_dir.is_dir():
+                    messagebox.showerror("Error", "PDF directory does not exist.")
+                    return
+                run_log_path = (pdf_to_jpeg_source_dir / "JPEG") / f"{convert_action}_run_{now_file_ts()}.txt"
+            elif convert_action == "jpeg-to-pdf":
+                if not jpeg_to_pdf_source_dir.exists() or not jpeg_to_pdf_source_dir.is_dir():
+                    messagebox.showerror("Error", "JPEG directory does not exist.")
+                    return
+                run_log_path = (jpeg_to_pdf_source_dir / "PDF") / f"{convert_action}_run_{now_file_ts()}.txt"
+            else:
+                messagebox.showerror("Error", f"Unsupported convert action: {convert_action}")
+                return
         else:
             if not replace_cropped_dir.exists() or not replace_cropped_dir.is_dir():
                 messagebox.showerror("Error", "Cropped directory does not exist.")
@@ -2904,7 +2997,7 @@ class App(tk.Tk):
 
         self.cancel_event.clear()
         self.pause_event.clear()
-        self.pause_btn_text.set("Pause")
+        self.pause_btn_text.set("PAUSE")
         self.pause_btn.set_text(self.pause_btn_text.get())
         self.progress["value"] = 0
         self._set_status("Starting detector...")
@@ -2970,6 +3063,28 @@ class App(tk.Tk):
                         hooks=hooks,
                         controller=controller,
                     )
+                elif mode == "convert":
+                    if convert_action == "pdf-to-jpeg":
+                        run_pdf_to_jpeg_pipeline(
+                            PdfToJpegRunConfig(
+                                source_dir=pdf_to_jpeg_source_dir,
+                                output_dir=pdf_to_jpeg_source_dir / "JPEG",
+                                run_log_path=run_log_path,
+                                render_dpi=220,
+                            ),
+                            hooks=hooks,
+                            controller=controller,
+                        )
+                    else:
+                        run_jpeg_to_pdf_pipeline(
+                            JpegToPdfRunConfig(
+                                source_dir=jpeg_to_pdf_source_dir,
+                                output_dir=jpeg_to_pdf_source_dir / "PDF",
+                                run_log_path=run_log_path,
+                            ),
+                            hooks=hooks,
+                            controller=controller,
+                        )
                 else:
                     run_replace_pipeline(
                         ReplaceRunConfig(
@@ -2982,16 +3097,27 @@ class App(tk.Tk):
                     )
             finally:
                 self.pause_event.clear()
-                self.after(0, lambda: self.pause_btn_text.set("Pause"))
+                self.after(0, lambda: self.pause_btn_text.set("PAUSE"))
                 self.after(0, lambda: self.pause_btn.set_text(self.pause_btn_text.get()))
                 self.after(0, lambda: self.progress.configure(value=0))
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
         self.worker_thread.start()
 
-def main() -> None:
+def legacy_tk_main() -> None:
     app = App()
     app.mainloop()
+
+
+def main() -> None:
+    script_path = Path(__file__).with_name("microfiche-preprocess-ui.py")
+    spec = importlib.util.spec_from_file_location("microfiche_preprocess_ui_main", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    module.main()
 
 
 if __name__ == "__main__":

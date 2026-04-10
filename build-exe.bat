@@ -46,7 +46,7 @@ python -m pip install -r requirements.txt pyinstaller >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [5/6] Build exe...
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name Microfiche-Preprocess microfiche-preprocess.py >> "%LOG%" 2>&1
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name Microfiche-Preprocess --icon microfiche-preprocess.ico --collect-all PySide6 --collect-all shiboken6 --collect-all fitz --collect-all PIL --hidden-import tkinter --hidden-import tkinter.ttk --hidden-import tkinter.filedialog --hidden-import tkinter.messagebox --hidden-import tkinter.font --hidden-import tkinter.scrolledtext --add-data "microfiche-preprocess.py;." --add-data "microfiche-preprocess-cli.py;." --add-data "fonts;fonts" microfiche-preprocess-ui.py >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [6/6] Verify output...
