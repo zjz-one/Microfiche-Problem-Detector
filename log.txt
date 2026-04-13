@@ -1,0 +1,12 @@
+[2026-04-13 09:45:12] Detector started.
+[2026-04-13 09:45:12] Mode: delicate-crop
+[2026-04-13 09:45:12] File count: 2
+[2026-04-13 09:45:12] Right indent percent: 4.0
+[2026-04-13 09:45:12] Run log: C:\Users\JZhou\OneDrive - Government of Manitoba\Digitizing Microfiche-Based Student Records - Documents\Project Documents\NIMBLE OVERLAP AND BLURRY\OVERLAP\cropped\d-cropped\delicate-crop-run-cli.txt
+[2026-04-13 09:45:12] Delicate crop failed B1_T2_13of24_B1_ISRAEL, ELAINE A - IVENIUK, WILLIAM T_P24.pdf: code=2: cannot open file 'C:\Users\JZhou\OneDrive - Government of Manitoba\Digitizing Microfiche-Based Student Records - Documents\Project Documents\NIMBLE OVERLAP AND BLURRY\OVERLAP\cropped\d-cropped\d-cropped\B1_T2_13of24_B1_ISRAEL, ELAINE A - IVENIUK, WILLIAM 
+[2026-04-13 09:45:12] Delicate crop failed CR_B1_T2_13of24_A2_IRWIN, MARGARET A I - ISAAC, CORNELIA_P69.pdf: code=2: cannot open file 'C:\Users\JZhou\OneDrive - Government of Manitoba\Digitizing Microfiche-Based Student Records - Documents\Project Documents\NIMBLE OVERLAP AND BLURRY\OVERLAP\cropped\d-cropped\d-cropped\CR_B1_T2_13of24_A2_IRWIN, MARGARET A I - ISAAC, CORN
+[2026-04-13 09:45:12] Updated files: 0
+[2026-04-13 09:45:12] Uncropped files: 2
+[2026-04-13 09:45:12] Errors: 2
+[2026-04-13 09:45:12] Elapsed seconds: 0.47
+[2026-04-13 09:45:12] Pipeline finished.
