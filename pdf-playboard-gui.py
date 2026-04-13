@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import sys
 from pathlib import Path
+from typing import Literal, Union
 
 import fitz
 from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QFontMetricsF,
     QGuiApplication,
     QImage,
     QKeySequence,
@@ -52,16 +55,77 @@ DATA_KIND = 0
 SELECTION_OUTLINE_COLOR = QColor(170, 170, 170)
 
 
-def render_first_page(pdf_path: Path, *, dpi: int = DEFAULT_RENDER_DPI) -> QImage:
+@dataclass(frozen=True)
+class RenderedPagePreview:
+    image: QImage
+    page_rect_pts: tuple[float, float, float, float]
+    page_index: int = 0
+
+
+@dataclass(frozen=True)
+class SourceClipMetadata:
+    source_pdf_path: str
+    page_index: int
+    clip_rect_pts: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class SourceClipElement:
+    kind: Literal["source-clip"]
+    source_pdf_path: str
+    page_index: int
+    clip_rect_pts: tuple[float, float, float, float]
+    target_rect_px: tuple[float, float, float, float]
+    rotation_deg: float
+
+
+@dataclass(frozen=True)
+class RasterPatchElement:
+    kind: Literal["raster-patch"]
+    image_png: bytes
+    target_rect_px: tuple[float, float, float, float]
+    rotation_deg: float
+
+
+@dataclass(frozen=True)
+class TextElement:
+    kind: Literal["text"]
+    text: str
+    target_rect_px: tuple[float, float, float, float]
+    pivot_px: tuple[float, float]
+    rotation_deg: float
+    font_size_pt: float
+    baseline_offset_px: float
+    line_height_px: float
+    bold: bool
+    color_rgb: tuple[float, float, float]
+
+
+PlayboardElement = Union[SourceClipElement, RasterPatchElement, TextElement]
+
+
+@dataclass
+class PlayboardComposition:
+    preview_image: QImage
+    size_px: tuple[float, float]
+    elements: list[PlayboardElement]
+
+
+def render_first_page(pdf_path: Path, *, dpi: int = DEFAULT_RENDER_DPI) -> RenderedPagePreview:
     doc = fitz.open(str(pdf_path))
     try:
         if len(doc) <= 0:
             raise ValueError("Source PDF has no pages.")
-        pix = doc[0].get_pixmap(dpi=dpi, colorspace=fitz.csRGB)
+        page = doc[0]
+        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB)
         image = QImage.fromData(pix.tobytes("png"), "PNG")
         if image.isNull():
             raise RuntimeError(f"Failed to render {pdf_path.name}.")
-        return image
+        return RenderedPagePreview(
+            image=image,
+            page_rect_pts=tuple(page.rect),
+            page_index=0,
+        )
     finally:
         doc.close()
 
@@ -74,6 +138,38 @@ def image_to_png_bytes(image: QImage) -> bytes:
     buffer.open(QBuffer.WriteOnly)
     image.save(buffer, "PNG")
     return bytes(byte_array)
+
+
+def qrectf_to_tuple(rect: QRectF) -> tuple[float, float, float, float]:
+    return (float(rect.x()), float(rect.y()), float(rect.width()), float(rect.height()))
+
+
+def tuple_to_qrectf(values: tuple[float, float, float, float]) -> QRectF:
+    x, y, width, height = values
+    return QRectF(float(x), float(y), float(width), float(height))
+
+
+def scene_px_rect_to_pdf_rect(rect: QRectF, *, render_dpi: int) -> fitz.Rect:
+    scale = 72.0 / float(render_dpi)
+    return fitz.Rect(
+        rect.x() * scale,
+        rect.y() * scale,
+        (rect.x() + rect.width()) * scale,
+        (rect.y() + rect.height()) * scale,
+    )
+
+
+def scene_px_point_to_pdf_point(point: tuple[float, float], *, render_dpi: int) -> fitz.Point:
+    scale = 72.0 / float(render_dpi)
+    return fitz.Point(point[0] * scale, point[1] * scale)
+
+
+def current_text_layout_dpi() -> float:
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return 96.0
+    dpi = float(screen.logicalDotsPerInchY())
+    return dpi if dpi > 0.0 else 96.0
 
 
 def resolve_playboard_output_paths(source_pdf: Path) -> dict[str, Path]:
@@ -90,9 +186,61 @@ def resolve_playboard_output_paths(source_pdf: Path) -> dict[str, Path]:
     }
 
 
-def save_playboard_pdf(source_pdf: Path, composed_image: QImage, *, render_dpi: int = DEFAULT_RENDER_DPI) -> dict[str, Path]:
+def _pdf_rect_from_tuple(values: tuple[float, float, float, float]) -> fitz.Rect:
+    return fitz.Rect(values)
+
+
+def _pdf_rotation_matrix(angle: float) -> fitz.Matrix:
+    matrix = fitz.Matrix(1.0, 1.0)
+    matrix.prerotate(float(angle))
+    return matrix
+
+
+def _write_text_element(page: fitz.Page, element: TextElement, *, render_dpi: int) -> None:
+    target_rect_px = tuple_to_qrectf(element.target_rect_px)
+    if target_rect_px.isEmpty() or element.text == "":
+        return
+    layout_dpi = current_text_layout_dpi()
+    pdf_font_size = float(element.font_size_pt) * layout_dpi / float(render_dpi)
+    fontname = "hebo" if element.bold else "helv"
+    writer = fitz.TextWriter(page.rect, color=element.color_rgb)
+    font = fitz.Font(fontname)
+    baseline = scene_px_point_to_pdf_point(
+        (target_rect_px.x(), target_rect_px.y() + element.baseline_offset_px),
+        render_dpi=render_dpi,
+    )
+    line_step = float(element.line_height_px) * 72.0 / float(render_dpi)
+    lines = element.text.splitlines() or [""]
+    for index, line in enumerate(lines):
+        writer.append(
+            fitz.Point(baseline.x, baseline.y + line_step * index),
+            line,
+            font=font,
+            fontsize=pdf_font_size,
+        )
+    morph = None
+    if abs(element.rotation_deg) > 0.001:
+        pivot = scene_px_point_to_pdf_point(element.pivot_px, render_dpi=render_dpi)
+        morph = (pivot, _pdf_rotation_matrix(element.rotation_deg))
+    writer.write_text(page, morph=morph, overlay=True)
+
+
+def _create_patch_document(image_png: bytes, target_rect_px: tuple[float, float, float, float], *, render_dpi: int) -> fitz.Document:
+    patch_rect = scene_px_rect_to_pdf_rect(tuple_to_qrectf(target_rect_px), render_dpi=render_dpi)
+    patch_doc = fitz.open()
+    patch_page = patch_doc.new_page(width=patch_rect.width, height=patch_rect.height)
+    patch_page.insert_image(patch_page.rect, stream=image_png)
+    return patch_doc
+
+
+def save_playboard_pdf(
+    source_pdf: Path,
+    composition: PlayboardComposition,
+    *,
+    render_dpi: int = DEFAULT_RENDER_DPI,
+) -> dict[str, Path]:
     source_pdf = source_pdf.expanduser().resolve()
-    if composed_image.isNull():
+    if composition.preview_image.isNull() or not composition.elements:
         raise ValueError("Nothing to save.")
     paths = resolve_playboard_output_paths(source_pdf)
     output_pdf = paths["output_pdf"]
@@ -102,16 +250,47 @@ def save_playboard_pdf(source_pdf: Path, composed_image: QImage, *, render_dpi: 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     original_pdf.parent.mkdir(parents=True, exist_ok=True)
 
-    png_bytes = image_to_png_bytes(composed_image)
-    doc = fitz.open()
+    output_doc = fitz.open()
+    source_docs: dict[str, fitz.Document] = {}
+    patch_docs: list[fitz.Document] = []
     try:
-        page_width = composed_image.width() * 72.0 / render_dpi
-        page_height = composed_image.height() * 72.0 / render_dpi
-        page = doc.new_page(width=page_width, height=page_height)
-        page.insert_image(page.rect, stream=png_bytes)
-        doc.save(str(temp_pdf), garbage=4, deflate=True)
+        page_width = float(composition.size_px[0]) * 72.0 / float(render_dpi)
+        page_height = float(composition.size_px[1]) * 72.0 / float(render_dpi)
+        page = output_doc.new_page(width=page_width, height=page_height)
+        for element in composition.elements:
+            if isinstance(element, SourceClipElement):
+                src_doc = source_docs.get(element.source_pdf_path)
+                if src_doc is None:
+                    src_doc = fitz.open(element.source_pdf_path)
+                    source_docs[element.source_pdf_path] = src_doc
+                page.show_pdf_page(
+                    scene_px_rect_to_pdf_rect(tuple_to_qrectf(element.target_rect_px), render_dpi=render_dpi),
+                    src_doc,
+                    element.page_index,
+                    keep_proportion=False,
+                    rotate=element.rotation_deg,
+                    clip=_pdf_rect_from_tuple(element.clip_rect_pts),
+                )
+                continue
+            if isinstance(element, TextElement):
+                _write_text_element(page, element, render_dpi=render_dpi)
+                continue
+            patch_doc = _create_patch_document(element.image_png, element.target_rect_px, render_dpi=render_dpi)
+            patch_docs.append(patch_doc)
+            page.show_pdf_page(
+                scene_px_rect_to_pdf_rect(tuple_to_qrectf(element.target_rect_px), render_dpi=render_dpi),
+                patch_doc,
+                0,
+                keep_proportion=False,
+                rotate=element.rotation_deg,
+            )
+        output_doc.save(str(temp_pdf), garbage=4, deflate=True)
     finally:
-        doc.close()
+        for doc in patch_docs:
+            doc.close()
+        for doc in source_docs.values():
+            doc.close()
+        output_doc.close()
 
     if original_pdf.exists():
         original_pdf.unlink()
@@ -169,9 +348,16 @@ class PlayboardTextItem(QGraphicsTextItem):
 
 
 class PlayboardPixmapItem(QGraphicsPixmapItem):
-    def __init__(self, owner_view: "PlayboardView", pixmap: QPixmap) -> None:
+    def __init__(
+        self,
+        owner_view: "PlayboardView",
+        pixmap: QPixmap,
+        *,
+        source_clip: SourceClipMetadata | None = None,
+    ) -> None:
         super().__init__(pixmap)
         self.owner_view = owner_view
+        self.source_clip = source_clip
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
 
     def paint(self, painter, option, widget=None) -> None:
@@ -260,6 +446,11 @@ class PlayboardView(PdfDropGraphicsView):
         self.board_rect_item: QGraphicsRectItem | None = None
         self.board_pixmap_item: QGraphicsPixmapItem | None = None
         self.board_image = QImage()
+        self.source_pdf_path = ""
+        self.source_page_index = 0
+        self.source_page_rect_pts: tuple[float, float, float, float] | None = None
+        self.source_image_scene_rect: QRectF | None = None
+        self.board_has_raster_edits = False
         self.board_scene.selectionChanged.connect(self._emit_selection_state)
         self.resetTransform()
         self._build_empty_scene()
@@ -277,6 +468,11 @@ class PlayboardView(PdfDropGraphicsView):
         self.selection_rect_item = None
         self.selection_scene_rect = None
         self.selected_outline_item = None
+        self.source_pdf_path = ""
+        self.source_page_index = 0
+        self.source_page_rect_pts = None
+        self.source_image_scene_rect = None
+        self.board_has_raster_edits = False
         empty_board = QImage(EMPTY_BOARD_SIZE, QImage.Format_RGB32)
         empty_board.fill(Qt.white)
         self._load_board_image(empty_board)
@@ -307,7 +503,14 @@ class PlayboardView(PdfDropGraphicsView):
                 self._sync_item_transform_origin(item)
         self.refresh_selected_outline()
 
-    def set_board_image(self, image: QImage) -> None:
+    def set_board_image(
+        self,
+        image: QImage,
+        *,
+        source_pdf_path: str = "",
+        source_page_index: int = 0,
+        source_page_rect_pts: tuple[float, float, float, float] | None = None,
+    ) -> None:
         self.resetTransform()
         self.board_scene.clear()
         self.selection_rect_item = None
@@ -322,6 +525,11 @@ class PlayboardView(PdfDropGraphicsView):
         painter.end()
         self._load_board_image(board_image)
         self.last_scene_pos = QPointF(float(BOARD_MARGIN), float(BOARD_MARGIN))
+        self.source_pdf_path = source_pdf_path
+        self.source_page_index = int(source_page_index)
+        self.source_page_rect_pts = source_page_rect_pts
+        self.source_image_scene_rect = QRectF(float(BOARD_MARGIN), float(BOARD_MARGIN), float(image.width()), float(image.height()))
+        self.board_has_raster_edits = False
         self.selectionStateChanged.emit(False)
         self.centerOn(self.board_pixmap_item)
 
@@ -437,8 +645,34 @@ class PlayboardView(PdfDropGraphicsView):
         painter.end()
         for item in items:
             self.board_scene.removeItem(item)
+        self.board_has_raster_edits = True
         self._refresh_board_pixmap()
         self.refresh_selected_outline()
+
+    def _source_clip_metadata_for_rect(self, rect: QRectF) -> SourceClipMetadata | None:
+        if (
+            self.board_has_raster_edits
+            or not self.source_pdf_path
+            or self.source_page_rect_pts is None
+            or self.source_image_scene_rect is None
+            or not self.source_image_scene_rect.contains(rect)
+        ):
+            return None
+        source_rect = self.source_image_scene_rect
+        page_rect = _pdf_rect_from_tuple(self.source_page_rect_pts)
+        x_scale = page_rect.width / source_rect.width()
+        y_scale = page_rect.height / source_rect.height()
+        clip_rect = fitz.Rect(
+            page_rect.x0 + (rect.x() - source_rect.x()) * x_scale,
+            page_rect.y0 + (rect.y() - source_rect.y()) * y_scale,
+            page_rect.x0 + (rect.x() + rect.width() - source_rect.x()) * x_scale,
+            page_rect.y0 + (rect.y() + rect.height() - source_rect.y()) * y_scale,
+        )
+        return SourceClipMetadata(
+            source_pdf_path=self.source_pdf_path,
+            page_index=self.source_page_index,
+            clip_rect_pts=tuple(clip_rect),
+        )
 
     def _cut_board_rect_to_overlay(self, rect: QRectF) -> QGraphicsPixmapItem | None:
         rect = rect.normalized().intersected(self.board_scene.sceneRect())
@@ -451,12 +685,14 @@ class PlayboardView(PdfDropGraphicsView):
         image = self.board_image.copy(x, y, width, height)
         if image.isNull():
             return None
+        source_clip = self._source_clip_metadata_for_rect(QRectF(float(x), float(y), float(width), float(height)))
         painter = QPainter(self.board_image)
         painter.fillRect(QRectF(float(x), float(y), float(width), float(height)), Qt.white)
         painter.end()
+        self.board_has_raster_edits = True
         self._refresh_board_pixmap()
 
-        item = PlayboardPixmapItem(self, QPixmap.fromImage(image))
+        item = PlayboardPixmapItem(self, QPixmap.fromImage(image), source_clip=source_clip)
         item.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
         item.setData(DATA_KIND, "content")
         item.setPos(float(x), float(y))
@@ -503,16 +739,90 @@ class PlayboardView(PdfDropGraphicsView):
         self.selectionStateChanged.emit(True)
         return item
 
-    def confirm_selection(self) -> QImage | None:
-        selected = self._selected_content_render()
-        if selected is None:
+    def _item_target_rect_px(self, item: QGraphicsItem, union_rect: QRectF) -> QRectF:
+        local_rect = item.boundingRect()
+        scene_pos = item.scenePos()
+        return QRectF(
+            float(scene_pos.x() - union_rect.x()),
+            float(scene_pos.y() - union_rect.y()),
+            float(local_rect.width()),
+            float(local_rect.height()),
+        )
+
+    def _item_pivot_px(self, item: QGraphicsItem, union_rect: QRectF) -> tuple[float, float]:
+        pivot = item.mapToScene(item.transformOriginPoint())
+        return (float(pivot.x() - union_rect.x()), float(pivot.y() - union_rect.y()))
+
+    def _build_text_element(self, item: PlayboardTextItem, union_rect: QRectF) -> TextElement:
+        color = item.defaultTextColor()
+        font = item.font()
+        point_size = font.pointSizeF() if font.pointSizeF() > 0 else float(font.pointSize())
+        metrics = QFontMetricsF(font)
+        if point_size <= 0:
+            point_size = metrics.height() * 72.0 / current_text_layout_dpi()
+        return TextElement(
+            kind="text",
+            text=item.toPlainText(),
+            target_rect_px=qrectf_to_tuple(self._item_target_rect_px(item, union_rect)),
+            pivot_px=self._item_pivot_px(item, union_rect),
+            rotation_deg=float(item.rotation()),
+            font_size_pt=float(point_size),
+            baseline_offset_px=float(metrics.ascent()),
+            line_height_px=float(metrics.lineSpacing()),
+            bold=bool(font.bold() or font.weight() >= 700),
+            color_rgb=(float(color.redF()), float(color.greenF()), float(color.blueF())),
+        )
+
+    def _build_selection_composition(self, items: list[QGraphicsItem]) -> PlayboardComposition | None:
+        rendered = self._render_overlay_items(items)
+        if rendered is None:
             return None
-        items, image = selected
+        preview_image, union_rect = rendered
+        elements: list[PlayboardElement] = []
+        for item in items:
+            if isinstance(item, PlayboardPixmapItem):
+                target_rect_px = qrectf_to_tuple(self._item_target_rect_px(item, union_rect))
+                if item.source_clip is not None:
+                    elements.append(
+                        SourceClipElement(
+                            kind="source-clip",
+                            source_pdf_path=item.source_clip.source_pdf_path,
+                            page_index=item.source_clip.page_index,
+                            clip_rect_pts=item.source_clip.clip_rect_pts,
+                            target_rect_px=target_rect_px,
+                            rotation_deg=float(item.rotation()),
+                        )
+                    )
+                    continue
+                elements.append(
+                    RasterPatchElement(
+                        kind="raster-patch",
+                        image_png=image_to_png_bytes(item.pixmap().toImage()),
+                        target_rect_px=target_rect_px,
+                        rotation_deg=float(item.rotation()),
+                    )
+                )
+                continue
+            if isinstance(item, PlayboardTextItem):
+                elements.append(self._build_text_element(item, union_rect))
+        return PlayboardComposition(
+            preview_image=preview_image,
+            size_px=(float(union_rect.width()), float(union_rect.height())),
+            elements=elements,
+        )
+
+    def confirm_selection(self) -> PlayboardComposition | None:
+        items = self.selected_content_items()
+        if not items:
+            return None
+        composition = self._build_selection_composition(items)
+        if composition is None:
+            return None
         for item in items:
             self.board_scene.removeItem(item)
         self.clear_selection_rect()
         self.selectionStateChanged.emit(False)
-        return image
+        return composition
 
     def current_selection_rect(self) -> QRectF | None:
         if self.selection_scene_rect is not None and not self.selection_scene_rect.isNull():
@@ -682,6 +992,7 @@ class PlayboardPanel(QWidget):
         super().__init__(parent)
         self.source_pdf_path = ""
         self.clipboard_image = QImage()
+        self.current_result_composition: PlayboardComposition | None = None
 
         self.save_button = QPushButton("SAVE")
         self.path_label = QLabel("")
@@ -805,7 +1116,7 @@ class PlayboardPanel(QWidget):
         has_selection = self.top_view.current_selection_rect() is not None
         has_selected_content = bool(self.top_view.selected_content_items())
         has_clipboard = not self.clipboard_image.isNull() or not QGuiApplication.clipboard().image().isNull()
-        has_result = not self.bottom_view.current_image.isNull()
+        has_result = self.current_result_composition is not None and not self.bottom_view.current_image.isNull()
 
         self.select_button.setEnabled(has_source)
         self.text_button.setEnabled(has_source)
@@ -827,14 +1138,20 @@ class PlayboardPanel(QWidget):
 
     def load_pdf(self, pdf_path: Path) -> None:
         try:
-            image = render_first_page(pdf_path)
+            preview = render_first_page(pdf_path)
         except Exception as exc:
             self._show_error(exc)
             return
         self.source_pdf_path = str(pdf_path.expanduser().resolve())
-        self.top_view.set_board_image(image)
+        self.top_view.set_board_image(
+            preview.image,
+            source_pdf_path=self.source_pdf_path,
+            source_page_index=preview.page_index,
+            source_page_rect_pts=preview.page_rect_pts,
+        )
         self.bottom_view.clear_result()
         self.clipboard_image = QImage()
+        self.current_result_composition = None
         self._set_tool_mode("select")
         self._refresh_actions()
 
@@ -853,28 +1170,30 @@ class PlayboardPanel(QWidget):
         self._refresh_actions()
 
     def confirm_selection(self) -> None:
-        image = self.top_view.confirm_selection()
-        if image is None or image.isNull():
+        composition = self.top_view.confirm_selection()
+        if composition is None or composition.preview_image.isNull():
             self._show_warning("Select an area first.")
             return
-        self.bottom_view.set_result_image(image)
+        self.current_result_composition = composition
+        self.bottom_view.set_result_image(composition.preview_image)
         self._refresh_actions()
 
     def save_result(self) -> None:
         if not self.source_pdf_path:
             self._show_warning("Open a PDF first.")
             return
-        if self.bottom_view.current_image.isNull():
+        if self.current_result_composition is None or self.bottom_view.current_image.isNull():
             self._show_warning("Confirm an area first.")
             return
         try:
-            output_paths = save_playboard_pdf(Path(self.source_pdf_path), self.bottom_view.current_image)
+            output_paths = save_playboard_pdf(Path(self.source_pdf_path), self.current_result_composition)
         except Exception as exc:
             self._show_error(exc)
             return
         self.path_label.setText(str(output_paths["output_pdf"]))
         self.source_pdf_path = ""
         self.clipboard_image = QImage()
+        self.current_result_composition = None
         self.top_view.clear_board()
         self.bottom_view.clear_result()
         self._refresh_actions()
