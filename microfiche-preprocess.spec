@@ -20,8 +20,10 @@ spec_root = Path.cwd()
 hiddenimports = (
     _hidden_imports_from(spec_root / "microfiche-preprocess.py")
     | _hidden_imports_from(spec_root / "microfiche-preprocess-cli.py")
+    | _hidden_imports_from(spec_root / "pdf-playboard-gui.py")
     | {"PIL.Image", "PIL.ImageOps"}
 ) - {"__future__"}
+
 
 a = Analysis(
     ["microfiche-preprocess-gui.py"],
@@ -30,6 +32,7 @@ a = Analysis(
     datas=[
         ("microfiche-preprocess.py", "."),
         ("microfiche-preprocess-cli.py", "."),
+        ("pdf-playboard-gui.py", "."),
     ],
     hiddenimports=sorted(hiddenimports),
     hookspath=[],

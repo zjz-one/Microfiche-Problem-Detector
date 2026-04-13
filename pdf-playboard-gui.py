@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import fitz
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QGuiApplication,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTextCursor,
+)
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QCheckBox,
+    QDoubleSpinBox,
+    QFrame,
+    QGraphicsItem,
+    QGraphicsPixmapItem,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsTextItem,
+    QGraphicsView,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QSpinBox,
+    QStyle,
+    QStyleOptionGraphicsItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_NAME = "pdf-playboard"
+BOARD_MARGIN = 240
+DEFAULT_RENDER_DPI = 180
+EMPTY_BOARD_SIZE = QSize(3200, 2200)
+EMPTY_RESULT_SIZE = QSize(1200, 320)
+DATA_KIND = 0
+SELECTION_OUTLINE_COLOR = QColor(170, 170, 170)
+
+
+def render_first_page(pdf_path: Path, *, dpi: int = DEFAULT_RENDER_DPI) -> QImage:
+    doc = fitz.open(str(pdf_path))
+    try:
+        if len(doc) <= 0:
+            raise ValueError("Source PDF has no pages.")
+        pix = doc[0].get_pixmap(dpi=dpi, colorspace=fitz.csRGB)
+        image = QImage.fromData(pix.tobytes("png"), "PNG")
+        if image.isNull():
+            raise RuntimeError(f"Failed to render {pdf_path.name}.")
+        return image
+    finally:
+        doc.close()
+
+
+def image_to_png_bytes(image: QImage) -> bytes:
+    from PySide6.QtCore import QBuffer, QByteArray
+
+    byte_array = QByteArray()
+    buffer = QBuffer(byte_array)
+    buffer.open(QBuffer.WriteOnly)
+    image.save(buffer, "PNG")
+    return bytes(byte_array)
+
+
+def resolve_playboard_output_paths(source_pdf: Path) -> dict[str, Path]:
+    source_pdf = source_pdf.expanduser().resolve()
+    cropped_root = next((parent for parent in source_pdf.parents if parent.name.lower() == "cropped"), None)
+    if cropped_root is None:
+        cropped_root = source_pdf.parent / "cropped"
+    playboard_root = cropped_root / "p-cropped"
+    return {
+        "cropped_root": cropped_root,
+        "playboard_root": playboard_root,
+        "output_pdf": playboard_root / "p-cropped" / source_pdf.name,
+        "original_pdf": playboard_root / "original" / source_pdf.name,
+    }
+
+
+def save_playboard_pdf(source_pdf: Path, composed_image: QImage, *, render_dpi: int = DEFAULT_RENDER_DPI) -> dict[str, Path]:
+    source_pdf = source_pdf.expanduser().resolve()
+    if composed_image.isNull():
+        raise ValueError("Nothing to save.")
+    paths = resolve_playboard_output_paths(source_pdf)
+    output_pdf = paths["output_pdf"]
+    original_pdf = paths["original_pdf"]
+    temp_pdf = output_pdf.with_name(f"{output_pdf.stem}.tmp{output_pdf.suffix}")
+
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    original_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    png_bytes = image_to_png_bytes(composed_image)
+    doc = fitz.open()
+    try:
+        page_width = composed_image.width() * 72.0 / render_dpi
+        page_height = composed_image.height() * 72.0 / render_dpi
+        page = doc.new_page(width=page_width, height=page_height)
+        page.insert_image(page.rect, stream=png_bytes)
+        doc.save(str(temp_pdf), garbage=4, deflate=True)
+    finally:
+        doc.close()
+
+    if original_pdf.exists():
+        original_pdf.unlink()
+    if not source_pdf.exists():
+        raise FileNotFoundError(f"Source PDF does not exist: {source_pdf}")
+    os.replace(str(source_pdf), str(original_pdf))
+    os.replace(str(temp_pdf), str(output_pdf))
+    return paths
+
+
+class PlayboardTextItem(QGraphicsTextItem):
+    def __init__(self, owner_view: "PlayboardView", text: str, point_size: int, bold: bool) -> None:
+        super().__init__(text)
+        self.owner_view = owner_view
+        self.setFlags(
+            QGraphicsItem.ItemIsMovable
+            | QGraphicsItem.ItemIsSelectable
+            | QGraphicsItem.ItemIsFocusable
+            | QGraphicsItem.ItemSendsGeometryChanges
+        )
+        self.setTextInteractionFlags(Qt.TextEditorInteraction)
+        self.setDefaultTextColor(QColor(22, 22, 22))
+        self.apply_style(point_size, bold)
+
+    def apply_style(self, point_size: int, bold: bool) -> None:
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.Document)
+        fmt = cursor.charFormat()
+        fmt.setFontPointSize(float(point_size))
+        fmt.setFontWeight(700 if bold else 400)
+        cursor.mergeCharFormat(fmt)
+        cursor.clearSelection()
+        self.setTextCursor(cursor)
+        font = self.font()
+        font.setPointSize(point_size)
+        font.setBold(bold)
+        self.setFont(font)
+
+    def paint(self, painter, option, widget=None) -> None:
+        styled_option = QStyleOptionGraphicsItem(option)
+        styled_option.state &= ~QStyle.State_Selected
+        styled_option.state &= ~QStyle.State_HasFocus
+        super().paint(painter, styled_option, widget)
+
+    def itemChange(self, change, value):
+        result = super().itemChange(change, value)
+        if change in {
+            QGraphicsItem.ItemSelectedHasChanged,
+            QGraphicsItem.ItemPositionHasChanged,
+            QGraphicsItem.ItemRotationHasChanged,
+            QGraphicsItem.ItemTransformHasChanged,
+        }:
+            self.owner_view.refresh_selected_outline()
+        return result
+
+
+class PlayboardPixmapItem(QGraphicsPixmapItem):
+    def __init__(self, owner_view: "PlayboardView", pixmap: QPixmap) -> None:
+        super().__init__(pixmap)
+        self.owner_view = owner_view
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+
+    def paint(self, painter, option, widget=None) -> None:
+        styled_option = QStyleOptionGraphicsItem(option)
+        styled_option.state &= ~QStyle.State_Selected
+        styled_option.state &= ~QStyle.State_HasFocus
+        super().paint(painter, styled_option, widget)
+
+    def itemChange(self, change, value):
+        result = super().itemChange(change, value)
+        if change in {
+            QGraphicsItem.ItemSelectedHasChanged,
+            QGraphicsItem.ItemPositionHasChanged,
+            QGraphicsItem.ItemRotationHasChanged,
+            QGraphicsItem.ItemTransformHasChanged,
+        }:
+            self.owner_view.refresh_selected_outline()
+        return result
+
+
+class PdfDropGraphicsView(QGraphicsView):
+    pdfDropped = Signal(list)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:
+        if self._pdf_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if self._pdf_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:
+        paths = self._pdf_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        self.pdfDropped.emit(paths)
+        event.acceptProposedAction()
+
+    @staticmethod
+    def _pdf_paths(mime_data) -> list[str]:
+        if not mime_data.hasUrls():
+            return []
+        out: list[str] = []
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile()).expanduser()
+            if path.suffix.lower() == ".pdf":
+                out.append(str(path))
+        return out
+
+
+class PlayboardView(PdfDropGraphicsView):
+    selectionStateChanged = Signal(bool)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.board_scene = QGraphicsScene(self)
+        self.setScene(self.board_scene)
+        self.setRenderHint(QPainter.Antialiasing, True)
+        self.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setBackgroundBrush(QColor(244, 244, 244))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+
+        self.tool_mode = "select"
+        self.text_point_size = 28
+        self.text_bold = False
+        self.last_scene_pos = QPointF(BOARD_MARGIN, BOARD_MARGIN)
+        self.rubber_origin: QPointF | None = None
+        self.selection_rect_item: QGraphicsRectItem | None = None
+        self.selection_scene_rect: QRectF | None = None
+        self.selected_outline_item: QGraphicsRectItem | None = None
+        self.board_rect_item: QGraphicsRectItem | None = None
+        self.board_pixmap_item: QGraphicsPixmapItem | None = None
+        self.board_image = QImage()
+        self.board_scene.selectionChanged.connect(self._emit_selection_state)
+        self.resetTransform()
+        self._build_empty_scene()
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.NativeGesture and event.gestureType() == Qt.ZoomNativeGesture:
+            factor = max(0.2, 1.0 + float(event.value()))
+            self.scale(factor, factor)
+            event.accept()
+            return True
+        return super().event(event)
+
+    def _build_empty_scene(self) -> None:
+        self.board_scene.clear()
+        self.selection_rect_item = None
+        self.selection_scene_rect = None
+        self.selected_outline_item = None
+        empty_board = QImage(EMPTY_BOARD_SIZE, QImage.Format_RGB32)
+        empty_board.fill(Qt.white)
+        self._load_board_image(empty_board)
+        self.viewport().update()
+        self.selectionStateChanged.emit(False)
+
+    def _emit_selection_state(self) -> None:
+        self.refresh_selected_outline()
+        self.selectionStateChanged.emit(self.current_selection_rect() is not None)
+
+    def selected_content_items(self) -> list[QGraphicsItem]:
+        return [item for item in self.board_scene.selectedItems() if item.data(DATA_KIND) == "content"]
+
+    def clear_board(self) -> None:
+        self.resetTransform()
+        self.last_scene_pos = QPointF(BOARD_MARGIN, BOARD_MARGIN)
+        self._build_empty_scene()
+
+    def set_tool_mode(self, mode: str) -> None:
+        self.tool_mode = mode
+
+    def set_text_style(self, point_size: int, bold: bool) -> None:
+        self.text_point_size = int(point_size)
+        self.text_bold = bool(bold)
+        for item in self.board_scene.selectedItems():
+            if isinstance(item, PlayboardTextItem):
+                item.apply_style(self.text_point_size, self.text_bold)
+                self._sync_item_transform_origin(item)
+        self.refresh_selected_outline()
+
+    def set_board_image(self, image: QImage) -> None:
+        self.resetTransform()
+        self.board_scene.clear()
+        self.selection_rect_item = None
+        self.selection_scene_rect = None
+        self.selected_outline_item = None
+        board_width = max(image.width() + BOARD_MARGIN * 2, int(image.width() * 2.8))
+        board_height = max(image.height() + BOARD_MARGIN * 2, int(image.height() * 2.5))
+        board_image = QImage(board_width, board_height, QImage.Format_RGB32)
+        board_image.fill(Qt.white)
+        painter = QPainter(board_image)
+        painter.drawImage(BOARD_MARGIN, BOARD_MARGIN, image)
+        painter.end()
+        self._load_board_image(board_image)
+        self.last_scene_pos = QPointF(float(BOARD_MARGIN), float(BOARD_MARGIN))
+        self.selectionStateChanged.emit(False)
+        self.centerOn(self.board_pixmap_item)
+
+    def _load_board_image(self, board_image: QImage) -> None:
+        self.board_image = board_image
+        board_rect = QRectF(0.0, 0.0, float(board_image.width()), float(board_image.height()))
+        self.board_rect_item = self.board_scene.addRect(board_rect, QPen(Qt.NoPen), QColor(Qt.white))
+        self.board_rect_item.setZValue(-100)
+        self.board_rect_item.setData(DATA_KIND, "board")
+        self.board_pixmap_item = self.board_scene.addPixmap(QPixmap.fromImage(board_image))
+        self.board_pixmap_item.setZValue(-50)
+        self.board_pixmap_item.setData(DATA_KIND, "board-image")
+        self.board_pixmap_item.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        self.board_pixmap_item.setFlag(QGraphicsItem.ItemIsMovable, False)
+        self.board_scene.setSceneRect(board_rect)
+
+    def zoom_in(self) -> None:
+        self.scale(1.15, 1.15)
+
+    def zoom_out(self) -> None:
+        self.scale(1.0 / 1.15, 1.0 / 1.15)
+
+    def reset_zoom(self) -> None:
+        self.resetTransform()
+
+    def _overlay_items(self) -> list[QGraphicsItem]:
+        return [item for item in self.board_scene.items() if item.data(DATA_KIND) == "content"]
+
+    def _committable_overlay_items(self) -> list[QGraphicsItem]:
+        return [item for item in self._overlay_items() if isinstance(item, PlayboardPixmapItem)]
+
+    @staticmethod
+    def _sync_item_transform_origin(item: QGraphicsItem) -> None:
+        if isinstance(item, (QGraphicsPixmapItem, QGraphicsTextItem)):
+            item.setTransformOriginPoint(item.boundingRect().center())
+
+    @staticmethod
+    def _united_scene_rect(items: list[QGraphicsItem]) -> QRectF:
+        rect = items[0].sceneBoundingRect()
+        for item in items[1:]:
+            rect = rect.united(item.sceneBoundingRect())
+        return rect.normalized()
+
+    def _ensure_selected_outline_item(self) -> None:
+        if self.selected_outline_item is not None:
+            return
+        pen = QPen(SELECTION_OUTLINE_COLOR, 2)
+        pen.setStyle(Qt.DashLine)
+        pen.setCosmetic(True)
+        self.selected_outline_item = self.board_scene.addRect(QRectF(), pen)
+        self.selected_outline_item.setBrush(Qt.NoBrush)
+        self.selected_outline_item.setZValue(250)
+        self.selected_outline_item.setData(DATA_KIND, "selected-outline")
+        self.selected_outline_item.setAcceptedMouseButtons(Qt.NoButton)
+
+    def refresh_selected_outline(self) -> None:
+        items = self.selected_content_items()
+        if not items:
+            if self.selected_outline_item is not None:
+                self.board_scene.removeItem(self.selected_outline_item)
+                self.selected_outline_item = None
+            return
+        self._ensure_selected_outline_item()
+        self.selected_outline_item.setRect(self._united_scene_rect(items))
+        self.selected_outline_item.show()
+
+    def _refresh_board_pixmap(self) -> None:
+        if self.board_pixmap_item is not None and not self.board_image.isNull():
+            self.board_pixmap_item.setPixmap(QPixmap.fromImage(self.board_image))
+
+    def _render_overlay_items(self, items: list[QGraphicsItem]) -> tuple[QImage, QRectF] | None:
+        if not items:
+            return None
+        rect = self._united_scene_rect(items)
+        width = max(1, int(round(rect.width())))
+        height = max(1, int(round(rect.height())))
+        image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+
+        all_items = list(self.board_scene.items())
+        visibility = {id(item): item.isVisible() for item in all_items}
+        try:
+            for item in all_items:
+                item.setVisible(item in items)
+            painter = QPainter(image)
+            self.board_scene.render(painter, QRectF(0.0, 0.0, float(width), float(height)), rect)
+            painter.end()
+        finally:
+            for item in all_items:
+                item.setVisible(visibility[id(item)])
+        return image, rect
+
+    def _selected_content_render(self) -> tuple[list[QGraphicsItem], QImage] | None:
+        items = self.selected_content_items()
+        if not items:
+            return None
+        rendered = self._render_overlay_items(items)
+        if rendered is None:
+            return None
+        image, _ = rendered
+        return items, image
+
+    def _commit_overlay_items(self) -> None:
+        items = self._committable_overlay_items()
+        if not items or self.board_image.isNull():
+            return
+        rendered = self._render_overlay_items(items)
+        if rendered is None:
+            return
+        image, rect = rendered
+        painter = QPainter(self.board_image)
+        painter.drawImage(rect.topLeft(), image)
+        painter.end()
+        for item in items:
+            self.board_scene.removeItem(item)
+        self._refresh_board_pixmap()
+        self.refresh_selected_outline()
+
+    def _cut_board_rect_to_overlay(self, rect: QRectF) -> QGraphicsPixmapItem | None:
+        rect = rect.normalized().intersected(self.board_scene.sceneRect())
+        if rect.width() < 2 or rect.height() < 2 or self.board_image.isNull():
+            return None
+        x = max(0, int(rect.x()))
+        y = max(0, int(rect.y()))
+        width = max(1, int(round(rect.width())))
+        height = max(1, int(round(rect.height())))
+        image = self.board_image.copy(x, y, width, height)
+        if image.isNull():
+            return None
+        painter = QPainter(self.board_image)
+        painter.fillRect(QRectF(float(x), float(y), float(width), float(height)), Qt.white)
+        painter.end()
+        self._refresh_board_pixmap()
+
+        item = PlayboardPixmapItem(self, QPixmap.fromImage(image))
+        item.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
+        item.setData(DATA_KIND, "content")
+        item.setPos(float(x), float(y))
+        item.setZValue(10)
+        self._sync_item_transform_origin(item)
+        self.board_scene.addItem(item)
+        self.board_scene.clearSelection()
+        item.setSelected(True)
+        return item
+
+    def copy_selection(self) -> QImage | None:
+        selected = self._selected_content_render()
+        if selected is None:
+            return None
+        _, image = selected
+        QGuiApplication.clipboard().setImage(image)
+        return image
+
+    def cut_selection(self) -> QImage | None:
+        selected = self._selected_content_render()
+        if selected is None:
+            return None
+        items, image = selected
+        for item in items:
+            self.board_scene.removeItem(item)
+        self.clear_selection_rect()
+        self.selectionStateChanged.emit(False)
+        QGuiApplication.clipboard().setImage(image)
+        return image
+
+    def paste_image(self, image: QImage | None = None) -> QGraphicsPixmapItem | None:
+        clip = image if image is not None else QGuiApplication.clipboard().image()
+        if clip.isNull():
+            return None
+        item = PlayboardPixmapItem(self, QPixmap.fromImage(clip))
+        item.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
+        item.setData(DATA_KIND, "content")
+        item.setPos(self.last_scene_pos)
+        item.setZValue(10)
+        self._sync_item_transform_origin(item)
+        self.board_scene.addItem(item)
+        self.board_scene.clearSelection()
+        item.setSelected(True)
+        self.selectionStateChanged.emit(True)
+        return item
+
+    def confirm_selection(self) -> QImage | None:
+        selected = self._selected_content_render()
+        if selected is None:
+            return None
+        items, image = selected
+        for item in items:
+            self.board_scene.removeItem(item)
+        self.clear_selection_rect()
+        self.selectionStateChanged.emit(False)
+        return image
+
+    def current_selection_rect(self) -> QRectF | None:
+        if self.selection_scene_rect is not None and not self.selection_scene_rect.isNull():
+            rect = self.selection_scene_rect.normalized().intersected(self.board_scene.sceneRect())
+            if rect.width() >= 2 and rect.height() >= 2:
+                return rect
+        selected_items = [item for item in self.board_scene.selectedItems() if item.data(DATA_KIND) == "content"]
+        if not selected_items:
+            return None
+        return self._united_scene_rect(selected_items)
+
+    def clear_selection_rect(self) -> None:
+        self.selection_scene_rect = None
+        if self.selection_rect_item is not None:
+            self.board_scene.removeItem(self.selection_rect_item)
+            self.selection_rect_item = None
+
+    def selected_rotation(self) -> float | None:
+        items = self.selected_content_items()
+        if not items:
+            return None
+        return float(items[0].rotation())
+
+    def set_selected_rotation(self, angle: float) -> None:
+        for item in self.selected_content_items():
+            self._sync_item_transform_origin(item)
+            item.setRotation(float(angle))
+        self.viewport().update()
+
+    def _ensure_selection_item(self) -> None:
+        if self.selection_rect_item is not None:
+            return
+        pen = QPen(QColor(170, 170, 170), 2)
+        pen.setStyle(Qt.DashLine)
+        self.selection_rect_item = self.board_scene.addRect(QRectF(), pen)
+        self.selection_rect_item.setBrush(Qt.NoBrush)
+        self.selection_rect_item.setZValue(200)
+        self.selection_rect_item.setData(DATA_KIND, "selection")
+        self.selection_rect_item.setAcceptedMouseButtons(Qt.NoButton)
+
+    def _top_content_item_at(self, point) -> object | None:
+        for item in self.items(point):
+            if item.data(DATA_KIND) == "content":
+                return item
+        return None
+
+    def _add_text_item(self, scene_pos: QPointF) -> None:
+        text_item = PlayboardTextItem(self, "Text", self.text_point_size, self.text_bold)
+        text_item.setPos(scene_pos)
+        text_item.setZValue(20)
+        text_item.setData(DATA_KIND, "content")
+        self._sync_item_transform_origin(text_item)
+        self.board_scene.addItem(text_item)
+        self.board_scene.clearSelection()
+        text_item.setSelected(True)
+        text_item.setFocus(Qt.MouseFocusReason)
+        cursor = text_item.textCursor()
+        cursor.select(QTextCursor.Document)
+        text_item.setTextCursor(cursor)
+        self.selectionStateChanged.emit(True)
+
+    def wheelEvent(self, event) -> None:
+        if event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier):
+            if event.angleDelta().y() > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        self.last_scene_pos = self.mapToScene(event.position().toPoint())
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        content_item = self._top_content_item_at(event.position().toPoint())
+        if self.tool_mode == "text":
+            if content_item is not None:
+                self.clear_selection_rect()
+                super().mousePressEvent(event)
+                return
+            self._add_text_item(self.last_scene_pos)
+            event.accept()
+            return
+        if content_item is not None:
+            self.clear_selection_rect()
+            super().mousePressEvent(event)
+            return
+        self._commit_overlay_items()
+        self.board_scene.clearSelection()
+        self.rubber_origin = self.last_scene_pos
+        self._ensure_selection_item()
+        self.selection_rect_item.setRect(QRectF(self.rubber_origin, self.rubber_origin))
+        self.selection_scene_rect = QRectF(self.rubber_origin, self.rubber_origin)
+        self._emit_selection_state()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        self.last_scene_pos = self.mapToScene(event.position().toPoint())
+        if self.rubber_origin is not None and self.selection_rect_item is not None:
+            rect = QRectF(self.rubber_origin, self.last_scene_pos).normalized()
+            self.selection_rect_item.setRect(rect)
+            self.selection_scene_rect = rect
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.rubber_origin is not None:
+            self.rubber_origin = None
+            rect = self.selection_scene_rect.normalized() if self.selection_scene_rect is not None else QRectF()
+            if rect.width() < 2 or rect.height() < 2:
+                self.clear_selection_rect()
+                self._emit_selection_state()
+            else:
+                self._cut_board_rect_to_overlay(rect)
+                self.clear_selection_rect()
+                self._emit_selection_state()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+        self._emit_selection_state()
+
+
+class ResultView(QGraphicsView):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.result_scene = QGraphicsScene(self)
+        self.setScene(self.result_scene)
+        self.setRenderHint(QPainter.Antialiasing, True)
+        self.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setBackgroundBrush(QColor(244, 244, 244))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.current_image = QImage()
+        self.clear_result()
+
+    def clear_result(self) -> None:
+        self.result_scene.clear()
+        self.current_image = QImage()
+        rect = QRectF(0.0, 0.0, float(EMPTY_RESULT_SIZE.width()), float(EMPTY_RESULT_SIZE.height()))
+        self.result_scene.addRect(rect, QPen(Qt.NoPen), QColor(Qt.white)).setZValue(-100)
+        self.result_scene.setSceneRect(rect)
+
+    def set_result_image(self, image: QImage | None) -> None:
+        self.result_scene.clear()
+        if image is None or image.isNull():
+            self.clear_result()
+            return
+        self.current_image = QImage(image)
+        rect = QRectF(0.0, 0.0, float(image.width()), float(image.height()))
+        self.result_scene.addRect(rect, QPen(Qt.NoPen), QColor(Qt.white)).setZValue(-100)
+        item = self.result_scene.addPixmap(QPixmap.fromImage(image))
+        item.setPos(0.0, 0.0)
+        self.result_scene.setSceneRect(rect)
+        self.fitInView(rect, Qt.KeepAspectRatio)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not self.current_image.isNull():
+            self.fitInView(self.result_scene.sceneRect(), Qt.KeepAspectRatio)
+
+
+class PlayboardPanel(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.source_pdf_path = ""
+        self.clipboard_image = QImage()
+
+        self.save_button = QPushButton("SAVE")
+        self.path_label = QLabel("")
+
+        self.select_button = QPushButton("SELECT")
+        self.text_button = QPushButton("TEXT")
+        self.confirm_button = QPushButton("CONFIRM")
+        self.text_size_input = QSpinBox()
+        self.text_bold_input = QCheckBox("BOLD")
+        self.rotate_input = QDoubleSpinBox()
+
+        self.top_view = PlayboardView()
+        self.bottom_view = ResultView()
+
+        self.select_button.setCheckable(True)
+        self.text_button.setCheckable(True)
+
+        self._build_ui()
+        self._wire_actions()
+        self._wire_shortcuts()
+        self._set_tool_mode("select")
+        self._sync_text_style()
+        self._refresh_actions()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        head_row = QHBoxLayout()
+        head_row.setContentsMargins(0, 0, 0, 0)
+        head_row.setSpacing(8)
+        head_row.addWidget(self.save_button)
+        head_row.addWidget(self.path_label, 1)
+        root.addLayout(head_row)
+
+        top_panel = QWidget()
+        top_layout = QVBoxLayout(top_panel)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(8)
+
+        tool_row = QHBoxLayout()
+        tool_row.setContentsMargins(0, 0, 0, 0)
+        tool_row.setSpacing(8)
+        self.text_size_input.setRange(8, 144)
+        self.text_size_input.setValue(28)
+        self.rotate_input.setRange(-360.0, 360.0)
+        self.rotate_input.setDecimals(1)
+        self.rotate_input.setSingleStep(1.0)
+        self.rotate_input.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.rotate_input.setFixedWidth(96)
+        tool_row.addWidget(self.select_button)
+        tool_row.addWidget(self.text_button)
+        tool_row.addWidget(self.confirm_button)
+        tool_row.addWidget(self.text_size_input)
+        tool_row.addWidget(self.text_bold_input)
+        tool_row.addWidget(self.rotate_input)
+        tool_row.addStretch(1)
+        top_layout.addLayout(tool_row)
+        top_layout.addWidget(self.top_view, 1)
+
+        bottom_panel = QWidget()
+        bottom_layout = QVBoxLayout(bottom_panel)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(8)
+        bottom_layout.addWidget(self.bottom_view, 1)
+
+        root.addWidget(top_panel, 3)
+        root.addWidget(bottom_panel, 2)
+
+    def _wire_actions(self) -> None:
+        self.save_button.clicked.connect(self.save_result)
+        self.select_button.clicked.connect(lambda: self._set_tool_mode("select"))
+        self.text_button.clicked.connect(lambda: self._set_tool_mode("text"))
+        self.confirm_button.clicked.connect(self.confirm_selection)
+        self.text_size_input.valueChanged.connect(self._sync_text_style)
+        self.text_bold_input.toggled.connect(self._sync_text_style)
+        self.rotate_input.valueChanged.connect(self._sync_rotation)
+        self.top_view.pdfDropped.connect(lambda paths: paths and self.load_pdf(Path(paths[0])))
+        self.top_view.selectionStateChanged.connect(lambda _value: self._refresh_actions())
+
+    def _wire_shortcuts(self) -> None:
+        for shortcut, callback in (
+            (QKeySequence.Copy, self.copy_selection),
+            (QKeySequence.Cut, self.cut_selection),
+            (QKeySequence.Paste, self.paste_selection),
+            (QKeySequence.ZoomIn, self.top_view.zoom_in),
+            (QKeySequence.ZoomOut, self.top_view.zoom_out),
+            ("Ctrl+0", self.top_view.reset_zoom),
+        ):
+            action = QAction(self)
+            action.setShortcut(shortcut)
+            action.triggered.connect(callback)
+            self.addAction(action)
+
+    def _set_tool_mode(self, mode: str) -> None:
+        self.top_view.set_tool_mode(mode)
+        self.select_button.setChecked(mode == "select")
+        self.text_button.setChecked(mode == "text")
+
+    def _show_warning(self, message: str) -> None:
+        QMessageBox.warning(self, APP_NAME, message)
+
+    def _show_error(self, exc: Exception) -> None:
+        QMessageBox.critical(self, APP_NAME, str(exc))
+
+    def _capture_selection_image(self, getter) -> None:
+        image = getter()
+        if image is not None:
+            self.clipboard_image = image
+        self._refresh_actions()
+
+    def _sync_text_style(self) -> None:
+        self.top_view.set_text_style(self.text_size_input.value(), self.text_bold_input.isChecked())
+
+    def _sync_rotation(self) -> None:
+        self.top_view.set_selected_rotation(self.rotate_input.value())
+
+    def _refresh_actions(self) -> None:
+        has_source = bool(self.source_pdf_path)
+        has_selection = self.top_view.current_selection_rect() is not None
+        has_selected_content = bool(self.top_view.selected_content_items())
+        has_clipboard = not self.clipboard_image.isNull() or not QGuiApplication.clipboard().image().isNull()
+        has_result = not self.bottom_view.current_image.isNull()
+
+        self.select_button.setEnabled(has_source)
+        self.text_button.setEnabled(has_source)
+        self.confirm_button.setEnabled(has_selection)
+        self.text_size_input.setEnabled(has_source)
+        self.text_bold_input.setEnabled(has_source)
+        self.rotate_input.setEnabled(has_selected_content)
+        rotation = self.top_view.selected_rotation()
+        self.rotate_input.blockSignals(True)
+        self.rotate_input.setValue(rotation if rotation is not None else 0.0)
+        self.rotate_input.blockSignals(False)
+        self.save_button.setEnabled(has_result and has_source)
+        self.path_label.setText(self.source_pdf_path or "")
+        self.top_view.setEnabled(True)
+        if has_source and has_clipboard:
+            self.top_view.viewport().setToolTip("Copy/Cut/Paste: Cmd/Ctrl+C, X, V. Zoom: Cmd/Ctrl+wheel or +/-")
+        else:
+            self.top_view.viewport().setToolTip("")
+
+    def load_pdf(self, pdf_path: Path) -> None:
+        try:
+            image = render_first_page(pdf_path)
+        except Exception as exc:
+            self._show_error(exc)
+            return
+        self.source_pdf_path = str(pdf_path.expanduser().resolve())
+        self.top_view.set_board_image(image)
+        self.bottom_view.clear_result()
+        self.clipboard_image = QImage()
+        self._set_tool_mode("select")
+        self._refresh_actions()
+
+    def copy_selection(self) -> None:
+        self._capture_selection_image(self.top_view.copy_selection)
+
+    def cut_selection(self) -> None:
+        self._capture_selection_image(self.top_view.cut_selection)
+
+    def paste_selection(self) -> None:
+        if not self.source_pdf_path:
+            return
+        item = self.top_view.paste_image(self.clipboard_image if not self.clipboard_image.isNull() else None)
+        if item is None:
+            self._show_warning("Nothing to paste.")
+        self._refresh_actions()
+
+    def confirm_selection(self) -> None:
+        image = self.top_view.confirm_selection()
+        if image is None or image.isNull():
+            self._show_warning("Select an area first.")
+            return
+        self.bottom_view.set_result_image(image)
+        self._refresh_actions()
+
+    def save_result(self) -> None:
+        if not self.source_pdf_path:
+            self._show_warning("Open a PDF first.")
+            return
+        if self.bottom_view.current_image.isNull():
+            self._show_warning("Confirm an area first.")
+            return
+        try:
+            output_paths = save_playboard_pdf(Path(self.source_pdf_path), self.bottom_view.current_image)
+        except Exception as exc:
+            self._show_error(exc)
+            return
+        self.path_label.setText(str(output_paths["output_pdf"]))
+        self.source_pdf_path = ""
+        self.clipboard_image = QImage()
+        self.top_view.clear_board()
+        self.bottom_view.clear_result()
+        self._refresh_actions()
+
+
+class PlayboardWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(1320, 920)
+        self.panel = PlayboardPanel(self)
+        self.setCentralWidget(self.panel)
+
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    window = PlayboardWindow()
+    window.show()
+    raise SystemExit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
